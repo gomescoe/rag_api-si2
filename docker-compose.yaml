@@ -1,6 +1,7 @@
 services:
   db:
     image: ankane/pgvector:latest
+    env_file: .env
     environment:
       POSTGRES_DB: mydatabase
       POSTGRES_USER: myuser
@@ -15,6 +16,7 @@ services:
     environment:
       - DB_HOST=db
       - DB_PORT=5432
+
     ports:
       - "8000:8000"
     volumes:

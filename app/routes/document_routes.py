@@ -22,7 +22,18 @@ from langchain_core.runnables import run_in_executor
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from functools import lru_cache
 
-from app.config import logger, vector_store, RAG_UPLOAD_DIR, CHUNK_SIZE, CHUNK_OVERLAP
+from app.config import (
+    logger, 
+    vector_store, 
+    RAG_UPLOAD_DIR, 
+    CHUNK_SIZE, 
+    CHUNK_OVERLAP, 
+    PDF_CHUNK_MODE, 
+    PDF_CHUNK_SIZE, 
+    PDF_CHUNK_OVERLAP, 
+    DEFAULT_TOP_K, 
+    MAX_TOP_K,
+)
 from app.constants import ERROR_MESSAGES
 from app.models import (
     StoreDocument,
@@ -38,6 +49,10 @@ from app.utils.document_loader import (
     cleanup_temp_encoding_file,
 )
 from app.utils.health import is_health_ok
+
+PDF_CHUNK_MODE = os.getenv("PDF_CHUNK_MODE", "page").lower()  # 'page' ou 'char'
+PDF_CHUNK_SIZE = int(os.getenv("PDF_CHUNK_SIZE", os.getenv("CHUNK_SIZE", "1500")))
+PDF_CHUNK_OVERLAP = int(os.getenv("PDF_CHUNK_OVERLAP", os.getenv("CHUNK_OVERLAP", "100")))
 
 router = APIRouter()
 
@@ -263,6 +278,7 @@ async def query_embeddings_by_file_id(
     body: QueryRequestBody,
     request: Request,
 ):
+    # --- auth igual ao seu código ---
     if not hasattr(request.state, "user"):
         user_authorized = body.entity_id if body.entity_id else "public"
     else:
@@ -270,26 +286,80 @@ async def query_embeddings_by_file_id(
             body.entity_id if body.entity_id else request.state.user.get("id")
         )
 
-    authorized_documents = []
+    authorized_documents: list = []
 
     try:
+        # k com default do .env + teto
+        k = body.k if isinstance(body.k, int) and body.k > 0 else DEFAULT_TOP_K
+        k = min(k, MAX_TOP_K)
+
+        # filtro base por file_id + merge com filtros opcionais do body
+        flt = {"file_id": body.file_id}
+        if body.filter:
+            if not isinstance(body.filter, dict):
+                raise HTTPException(
+                    status_code=422,
+                    detail="`filter` deve ser um objeto (JSON)."
+                )
+            flt.update(body.filter)
+
+        # embedding da consulta (com cache LRU)
         embedding = get_cached_query_embedding(body.query)
 
-        if isinstance(vector_store, AsyncPgVector):
-            documents = await vector_store.asimilarity_search_with_score_by_vector(
-                embedding,
-                k=body.k,
-                filter={"file_id": body.file_id},
-                executor=request.app.state.thread_pool,
-            )
+        # --- execução da busca ---
+        if body.search_type == "mmr":
+            fetch_k = body.fetch_k or max(k * 4, k)
+            if isinstance(vector_store, AsyncPgVector):
+                # pgvector assíncrono não expõe MMR nativo; fazemos um fallback:
+                docs = await vector_store.asimilarity_search_with_score_by_vector(
+                    embedding,
+                    k=fetch_k,
+                    filter=flt,
+                    executor=request.app.state.thread_pool,
+                )
+                # fallback simples: pegar os k melhores do pool (se quiser MMR "real", dá pra implementar depois)
+                documents = docs[:k]
+            else:
+                # se sua implementação síncrona tiver MMR nativo, use:
+                try:
+                    docs_only = vector_store.max_marginal_relevance_search_by_vector(
+                        embedding,
+                        k=k,
+                        fetch_k=fetch_k,
+                        filter=flt,
+                        lambda_mult=body.lambda_mult or 0.5,
+                    )
+                    documents = [(d, None) for d in docs_only]
+                except AttributeError:
+                    # fallback para similaridade
+                    documents = vector_store.similarity_search_with_score_by_vector(
+                        embedding, k=k, filter=flt
+                    )
         else:
-            documents = vector_store.similarity_search_with_score_by_vector(
-                embedding, k=body.k, filter={"file_id": body.file_id}
-            )
+            # similaridade padrão
+            if isinstance(vector_store, AsyncPgVector):
+                documents = await vector_store.asimilarity_search_with_score_by_vector(
+                    embedding,
+                    k=k,
+                    filter=flt,
+                    executor=request.app.state.thread_pool,
+                )
+            else:
+                documents = vector_store.similarity_search_with_score_by_vector(
+                    embedding, k=k, filter=flt
+                )
+
+        # filtro opcional por distância/score (menor = melhor)
+        if body.max_distance is not None:
+            documents = [
+                (d, s) for (d, s) in documents
+                if (s is None or s <= body.max_distance)
+            ]
 
         if not documents:
             return authorized_documents
 
+        # --- autorização (mesma lógica que você já tinha) ---
         document, score = documents[0]
         doc_metadata = document.metadata
         doc_user_id = doc_metadata.get("user_id")
@@ -297,7 +367,6 @@ async def query_embeddings_by_file_id(
         if doc_user_id is None or doc_user_id == user_authorized:
             authorized_documents = documents
         else:
-            # If using entity_id and access denied, try again with user's actual ID
             if body.entity_id and hasattr(request.state, "user"):
                 user_authorized = request.state.user.get("id")
                 if doc_user_id == user_authorized:
@@ -335,7 +404,6 @@ async def query_embeddings_by_file_id(
         )
         raise HTTPException(status_code=500, detail=str(e))
 
-
 def generate_digest(page_content: str):
     try:
         hash_obj = hashlib.md5(page_content.encode("utf-8"))
@@ -353,10 +421,32 @@ async def store_data_in_vector_db(
     clean_content: bool = False,
     executor=None,
 ) -> bool:
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
-    )
-    documents = text_splitter.split_documents(data)
+    # 'clean_content' já vem True para PDFs (ver chamadas nas rotas)
+    data = list(data)  # garante reuso (caso seja gerador)
+
+    if clean_content:  # PDF
+        if PDF_CHUNK_MODE == "page":
+            # 1 página = 1 chunk (usa os Documents que o loader já gera por página)
+            documents = data
+            logger.info("PDF_CHUNK_MODE=page: %s páginas = %s chunks", len(data), len(documents))
+        else:
+            # split por caracteres só para PDF, com valores dedicados (ou herdados do global)
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=PDF_CHUNK_SIZE,
+                chunk_overlap=PDF_CHUNK_OVERLAP,
+            )
+            documents = text_splitter.split_documents(data)
+            logger.info(
+                "PDF_CHUNK_MODE=char: chunk_size=%s overlap=%s -> %s chunks",
+                PDF_CHUNK_SIZE, PDF_CHUNK_OVERLAP, len(documents)
+            )
+    else:
+        # Demais tipos de arquivo continuam usando os valores globais
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+        )
+        documents = text_splitter.split_documents(data)
 
     # If `clean_content` is True, clean the page_content of each document (remove null bytes)
     if clean_content:
@@ -662,29 +752,68 @@ async def embed_file_upload(
 @router.post("/query_multiple")
 async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody):
     try:
-        # Get the embedding of the query text
+        # k com default do .env e teto
+        k = body.k if isinstance(body.k, int) and body.k > 0 else DEFAULT_TOP_K
+        k = min(k, MAX_TOP_K)
+
+        # filtro base: vários file_ids
+        flt = {"file_id": {"$in": body.file_ids}}
+        if body.filter:
+            if not isinstance(body.filter, dict):
+                raise HTTPException(status_code=422, detail="`filter` deve ser um objeto (JSON).")
+            flt.update(body.filter)
+
+        # embedding da consulta (cache LRU)
         embedding = get_cached_query_embedding(body.query)
 
-        # Perform similarity search with the query embedding and filter by the file_ids in metadata
-        if isinstance(vector_store, AsyncPgVector):
-            documents = await vector_store.asimilarity_search_with_score_by_vector(
-                embedding,
-                k=body.k,
-                filter={"file_id": {"$in": body.file_ids}},
-                executor=request.app.state.thread_pool,
-            )
+        # Busca: similarity ou MMR
+        if body.search_type == "mmr":
+            fetch_k = body.fetch_k or max(k * 4, k)
+            if isinstance(vector_store, AsyncPgVector):
+                # Sem MMR nativo no async → fallback: pega um pool maior e corta em k
+                docs = await vector_store.asimilarity_search_with_score_by_vector(
+                    embedding,
+                    k=fetch_k,
+                    filter=flt,
+                    executor=request.app.state.thread_pool,
+                )
+                documents = docs[:k]
+            else:
+                try:
+                    docs_only = vector_store.max_marginal_relevance_search_by_vector(
+                        embedding,
+                        k=k,
+                        fetch_k=fetch_k,
+                        filter=flt,
+                        lambda_mult=body.lambda_mult or 0.5,
+                    )
+                    documents = [(d, None) for d in docs_only]
+                except AttributeError:
+                    documents = vector_store.similarity_search_with_score_by_vector(
+                        embedding, k=k, filter=flt
+                    )
         else:
-            documents = vector_store.similarity_search_with_score_by_vector(
-                embedding, k=body.k, filter={"file_id": {"$in": body.file_ids}}
-            )
+            if isinstance(vector_store, AsyncPgVector):
+                documents = await vector_store.asimilarity_search_with_score_by_vector(
+                    embedding,
+                    k=k,
+                    filter=flt,
+                    executor=request.app.state.thread_pool,
+                )
+            else:
+                documents = vector_store.similarity_search_with_score_by_vector(
+                    embedding, k=k, filter=flt
+                )
 
-        # Ensure documents list is not empty
+        # Filtro opcional por distância/score (menor = melhor)
+        if body.max_distance is not None:
+            documents = [(d, s) for (d, s) in documents if (s is None or s <= body.max_distance)]
+
         if not documents:
-            raise HTTPException(
-                status_code=404, detail="No documents found for the given query"
-            )
+            raise HTTPException(status_code=404, detail="No documents found for the given query")
 
         return documents
+
     except HTTPException as http_exc:
         logger.error(
             "HTTP Exception in query_embeddings_by_file_ids | Status: %d | Detail: %s",
@@ -701,7 +830,6 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
             traceback.format_exc(),
         )
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.post("/text")
 async def extract_text_from_file(

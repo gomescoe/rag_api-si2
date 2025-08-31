@@ -28,6 +28,7 @@ class EmbeddingsProvider(Enum):
     BEDROCK = "bedrock"
     GOOGLE_GENAI = "google_genai"
     GOOGLE_VERTEXAI = "vertexai"
+    VOYAGE = "voyageai"
 
 
 def get_env_variable(
@@ -69,6 +70,11 @@ MONGO_VECTOR_COLLECTION = get_env_variable(
 )  # Deprecated, backwards compatability
 CHUNK_SIZE = int(get_env_variable("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(get_env_variable("CHUNK_OVERLAP", "100"))
+
+PDF_CHUNK_MODE = os.getenv("PDF_CHUNK_MODE", "page").strip().lower()  # 'page' ou 'char'
+PDF_CHUNK_SIZE = int(os.getenv("PDF_CHUNK_SIZE", os.getenv("CHUNK_SIZE", "1500")))
+PDF_CHUNK_OVERLAP = int(os.getenv("PDF_CHUNK_OVERLAP", os.getenv("CHUNK_OVERLAP", "100")))
+
 
 env_value = get_env_variable("PDF_EXTRACT_IMAGES", "False").lower()
 PDF_EXTRACT_IMAGES = True if env_value == "true" else False
@@ -170,6 +176,7 @@ logging.getLogger("uvicorn.access").disabled = True
 
 ## Credentials
 
+VOYAGE_API_KEY = get_env_variable("VOYAGE_API_KEY", "")
 OPENAI_API_KEY = get_env_variable("OPENAI_API_KEY", "")
 RAG_OPENAI_API_KEY = get_env_variable("RAG_OPENAI_API_KEY", OPENAI_API_KEY)
 RAG_OPENAI_BASEURL = get_env_variable("RAG_OPENAI_BASEURL", None)
@@ -194,6 +201,9 @@ AWS_SESSION_TOKEN = get_env_variable("AWS_SESSION_TOKEN", "")
 GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIALS", "")
 env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
 RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
+
+DEFAULT_TOP_K = int(os.getenv("RAG_DEFAULT_TOP_K", "12"))
+MAX_TOP_K = int(os.getenv("RAG_MAX_TOP_K", "100"))
 
 ## Embeddings
 
@@ -264,6 +274,13 @@ def init_embeddings(provider, model):
             model_id=model,
             region_name=AWS_DEFAULT_REGION,
         )
+    elif provider == EmbeddingsProvider.VOYAGE:
+        from langchain_voyageai import VoyageAIEmbeddings
+        # batch_size padrão é escolhido pelo wrapper; você pode ajustar via env se quiser
+        return VoyageAIEmbeddings(
+            model=model,
+            api_key=VOYAGE_API_KEY,
+        )
     else:
         raise ValueError(f"Unsupported embeddings provider: {provider}")
 
@@ -299,6 +316,9 @@ elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.BEDROCK:
         "EMBEDDINGS_MODEL", "amazon.titan-embed-text-v1"
     )
     AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION", "us-east-1")
+elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.VOYAGE:
+    # escolha um modelo Voyage; ex.: voyage-3.5, voyage-3, voyage-3-lite
+    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "voyage-3.5")
 else:
     raise ValueError(f"Unsupported embeddings provider: {EMBEDDINGS_PROVIDER}")
 
