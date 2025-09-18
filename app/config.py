@@ -71,7 +71,7 @@ MONGO_VECTOR_COLLECTION = get_env_variable(
 CHUNK_SIZE = int(get_env_variable("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(get_env_variable("CHUNK_OVERLAP", "100"))
 
-PDF_CHUNK_MODE = os.getenv("PDF_CHUNK_MODE", "page").strip().lower()  # 'page' ou 'char'
+PDF_CHUNK_MODE = os.getenv("PDF_CHUNK_MODE", "char").strip().lower()  # 'page' ou 'char'
 PDF_CHUNK_SIZE = int(os.getenv("PDF_CHUNK_SIZE", os.getenv("CHUNK_SIZE", "1500")))
 PDF_CHUNK_OVERLAP = int(os.getenv("PDF_CHUNK_OVERLAP", os.getenv("CHUNK_OVERLAP", "100")))
 
@@ -202,7 +202,7 @@ GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIAL
 env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
 RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
 
-DEFAULT_TOP_K = int(os.getenv("RAG_DEFAULT_TOP_K", "12"))
+DEFAULT_TOP_K = int(os.getenv("RAG_DEFAULT_TOP_K", "30"))
 MAX_TOP_K = int(os.getenv("RAG_MAX_TOP_K", "100"))
 
 ## Embeddings
