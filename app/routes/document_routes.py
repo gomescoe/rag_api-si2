@@ -50,10 +50,6 @@ from app.utils.document_loader import (
 )
 from app.utils.health import is_health_ok
 
-PDF_CHUNK_MODE = os.getenv("PDF_CHUNK_MODE", "page").lower()  # 'page' ou 'char'
-PDF_CHUNK_SIZE = int(os.getenv("PDF_CHUNK_SIZE", os.getenv("CHUNK_SIZE", "1500")))
-PDF_CHUNK_OVERLAP = int(os.getenv("PDF_CHUNK_OVERLAP", os.getenv("CHUNK_OVERLAP", "100")))
-
 router = APIRouter()
 
 
