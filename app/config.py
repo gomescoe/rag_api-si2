@@ -202,7 +202,7 @@ GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIAL
 env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
 RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
 
-DEFAULT_TOP_K = int(os.getenv("RAG_DEFAULT_TOP_K", "40"))
+DEFAULT_TOP_K = int(os.getenv("RAG_DEFAULT_TOP_K", "12"))
 MAX_TOP_K = int(os.getenv("RAG_MAX_TOP_K", "100"))
 
 ## Embeddings
