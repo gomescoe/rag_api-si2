@@ -1,5 +1,6 @@
 # app/routes/document_routes.py
 import os
+import re
 import hashlib
 import traceback
 import aiofiles
@@ -17,22 +18,23 @@ from fastapi import (
     Query,
     status,
 )
+from fastapi.responses import JSONResponse
 from langchain_core.documents import Document
 from langchain_core.runnables import run_in_executor
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from functools import lru_cache
 
 from app.config import (
-    logger, 
-    vector_store, 
-    RAG_UPLOAD_DIR, 
-    CHUNK_SIZE, 
-    CHUNK_OVERLAP, 
-    PDF_CHUNK_MODE, 
-    PDF_CHUNK_SIZE, 
-    PDF_CHUNK_OVERLAP, 
-    DEFAULT_TOP_K, 
-    MAX_TOP_K,
+    logger,
+    vector_store,
+    RAG_UPLOAD_DIR,
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
+    PDF_CHUNK_MODE,      # ← vem do config
+    PDF_CHUNK_SIZE,      # ← vem do config
+    PDF_CHUNK_OVERLAP,   # ← vem do config
+    DEFAULT_TOP_K,       # ← vem do config (.env: RAG_DEFAULT_TOP_K)
+    MAX_TOP_K,           # ← vem do config (.env: RAG_MAX_TOP_K)
 )
 from app.constants import ERROR_MESSAGES
 from app.models import (
@@ -50,12 +52,43 @@ from app.utils.document_loader import (
 )
 from app.utils.health import is_health_ok
 
-PDF_CHUNK_MODE = os.getenv("PDF_CHUNK_MODE", "page").lower()  # 'page' ou 'char'
-PDF_CHUNK_SIZE = int(os.getenv("PDF_CHUNK_SIZE", os.getenv("CHUNK_SIZE", "1500")))
-PDF_CHUNK_OVERLAP = int(os.getenv("PDF_CHUNK_OVERLAP", os.getenv("CHUNK_OVERLAP", "100")))
-
 router = APIRouter()
 
+# ---------- Utilitários de normalização/limpeza de chunks ----------
+
+def _normalize_text(s: str) -> str:
+    """Compacta espaços e remove bordas; garante string válida."""
+    if not isinstance(s, str):
+        return ""
+    return re.sub(r"\s+", " ", s).strip()
+
+def _clean_chunks_texts(texts: List[str]) -> List[str]:
+    """Aplica normalização + filtro de vazios + filtro por tamanho mínimo via ENV."""
+    norm = [_normalize_text(t) for t in texts]
+    norm = [t for t in norm if t]  # remove vazios
+    min_len = int(os.getenv("RAG_MIN_CHUNK_LEN", "10"))
+    if min_len > 0:
+        norm = [t for t in norm if len(t) >= min_len]
+    return norm
+
+def _filter_documents_inplace(documents: List[Document]) -> List[Document]:
+    """
+    Normaliza `page_content` de cada Document, descarta vazios/curtos.
+    Retorna a lista filtrada (e normaliza in-place o conteúdo mantido).
+    """
+    min_len = int(os.getenv("RAG_MIN_CHUNK_LEN", "10"))
+    filtered: List[Document] = []
+    for doc in documents:
+        txt = _normalize_text(getattr(doc, "page_content", "") or "")
+        if not txt:
+            continue
+        if min_len > 0 and len(txt) < min_len:
+            continue
+        doc.page_content = txt  # normalizado
+        filtered.append(doc)
+    return filtered
+
+# -------------------------------------------------------------------
 
 def get_user_id(request: Request, entity_id: str = None) -> str:
     """Extract user ID from request or entity_id."""
@@ -229,44 +262,6 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/documents")
-async def delete_documents(request: Request, document_ids: List[str] = Body(...)):
-    try:
-        if isinstance(vector_store, AsyncPgVector):
-            existing_ids = await vector_store.get_filtered_ids(
-                document_ids, executor=request.app.state.thread_pool
-            )
-            await vector_store.delete(
-                ids=document_ids, executor=request.app.state.thread_pool
-            )
-        else:
-            existing_ids = vector_store.get_filtered_ids(document_ids)
-            vector_store.delete(ids=document_ids)
-
-        if not all(id in existing_ids for id in document_ids):
-            raise HTTPException(status_code=404, detail="One or more IDs not found")
-
-        file_count = len(document_ids)
-        return {
-            "message": f"Documents for {file_count} file{'s' if file_count > 1 else ''} deleted successfully"
-        }
-    except HTTPException as http_exc:
-        logger.error(
-            "HTTP Exception in delete_documents | Status: %d | Detail: %s",
-            http_exc.status_code,
-            http_exc.detail,
-        )
-        raise http_exc
-    except Exception as e:
-        logger.error(
-            "Failed to delete documents | IDs: %s | Error: %s | Traceback: %s",
-            document_ids,
-            str(e),
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 # Cache the embedding function with LRU cache
 @lru_cache(maxsize=128)
 def get_cached_query_embedding(query: str):
@@ -310,17 +305,15 @@ async def query_embeddings_by_file_id(
         if body.search_type == "mmr":
             fetch_k = body.fetch_k or max(k * 4, k)
             if isinstance(vector_store, AsyncPgVector):
-                # pgvector assíncrono não expõe MMR nativo; fazemos um fallback:
+                # pgvector assíncrono não expõe MMR nativo; fallback
                 docs = await vector_store.asimilarity_search_with_score_by_vector(
                     embedding,
                     k=fetch_k,
                     filter=flt,
                     executor=request.app.state.thread_pool,
                 )
-                # fallback simples: pegar os k melhores do pool (se quiser MMR "real", dá pra implementar depois)
                 documents = docs[:k]
             else:
-                # se sua implementação síncrona tiver MMR nativo, use:
                 try:
                     docs_only = vector_store.max_marginal_relevance_search_by_vector(
                         embedding,
@@ -331,7 +324,6 @@ async def query_embeddings_by_file_id(
                     )
                     documents = [(d, None) for d in docs_only]
                 except AttributeError:
-                    # fallback para similaridade
                     documents = vector_store.similarity_search_with_score_by_vector(
                         embedding, k=k, filter=flt
                     )
@@ -448,12 +440,39 @@ async def store_data_in_vector_db(
         )
         documents = text_splitter.split_documents(data)
 
-    # If `clean_content` is True, clean the page_content of each document (remove null bytes)
+    # Se PDF, limpe caracteres indesejados
     if clean_content:
         for doc in documents:
-            doc.page_content = clean_text(doc.page_content)
+            if not doc.page_content or not doc.page_content.strip():
+                doc.page_content = "."
 
-    # Preparing documents with page content and metadata for insertion.
+    # --------- NOVO: normaliza e filtra vazios/curtos antes de persistir ---------
+    raw_len = len(documents)
+    documents = _filter_documents_inplace(documents)
+    clean_len = len(documents)
+
+    logger.info(
+        "Embed chunks stats | file_id=%s user_id=%s raw=%s clean=%s min_len=%s",
+        file_id,
+        user_id,
+        raw_len,
+        clean_len,
+        int(os.getenv("RAG_MIN_CHUNK_LEN", "10")),
+    )
+
+    if clean_len == 0:
+        # Não tente embed/persistir se ficou tudo vazio
+        logger.warning(
+            "No embeddable text after cleaning (file_id=%s, user=%s)",
+            file_id, user_id
+        )
+        return {
+            "message": "No embeddable text found. The document may be empty/image-only or OCR failed.",
+            "error": "EMPTY_EMBED_INPUT",
+        }
+    # ---------------------------------------------------------------------------
+
+    # Preparando documentos finais com metadados
     docs = [
         Document(
             page_content=doc.page_content,
@@ -597,14 +616,23 @@ async def embed_file(
             )
         elif "error" in result:
             response_status = False
-            response_message = "Failed to process/store the file data."
-            if isinstance(result["error"], str):
-                response_message = result["error"]
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="An unspecified error occurred.",
+            # Se vier nosso erro "EMPTY_EMBED_INPUT", devolve 400 elegante
+            if result["error"] == "EMPTY_EMBED_INPUT":
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": False,
+                        "message": "No embeddable text found. The document may be empty/image-only or OCR failed.",
+                        "file_id": file_id,
+                        "filename": file.filename,
+                        "known_type": known_type,
+                    },
                 )
+            response_message = isinstance(result["error"], str) and result["error"] or "Failed to process/store the file data."
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=response_message,
+            )
     except HTTPException as http_exc:
         response_status = False
         response_message = f"HTTP Exception: {http_exc.detail}"
@@ -718,6 +746,22 @@ async def embed_file_upload(
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to process/store the file data.",
+            )
+        elif "error" in result:
+            if result["error"] == "EMPTY_EMBED_INPUT":
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": False,
+                        "message": "No embeddable text found. The document may be empty/image-only or OCR failed.",
+                        "file_id": file_id,
+                        "filename": uploaded_file.filename,
+                        "known_type": known_type,
+                    },
+                )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=str(result["error"]),
             )
     except HTTPException as http_exc:
         logger.error(
